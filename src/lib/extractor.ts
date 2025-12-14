@@ -1,9 +1,5 @@
 const LANG_SYMBOL = 'S'; // Spanish
-
-interface MediaData {
-  title: string;
-  vttUrl: string | null;
-}
+const CORS_PROXY = 'https://corsproxy.io/?';
 
 function cleanFileName(name: string): string {
   return name.replace(/[\\/*?:"<>|]/g, '');
@@ -42,73 +38,125 @@ function convertVttToText(vttContent: string): string {
   return fullText.trim();
 }
 
-export async function extractFromUrl(url: string): Promise<{ title: string; content: string } | null> {
-  // Extract media key from URL
+function extractMediaKey(url: string): string | null {
+  // Clean the URL
   const cleanUrl = url.split('?')[0].trim();
-  const match = cleanUrl.match(/\/([^/]+)$/);
+  
+  // Try different URL patterns
+  // Pattern 1: /finder?lank=... format - extract lank parameter
+  const lankMatch = url.match(/[?&]lank=([^&]+)/i);
+  if (lankMatch) {
+    return lankMatch[1];
+  }
+  
+  // Pattern 2: Direct media key in path like /es/video/pub-mwbv_202412_4_VIDEO
+  const pubMatch = cleanUrl.match(/\/(pub-[^/]+)/i);
+  if (pubMatch) {
+    return pubMatch[1];
+  }
+  
+  // Pattern 3: docid parameter
+  const docidMatch = url.match(/[?&]docid=([^&]+)/i);
+  if (docidMatch) {
+    return docidMatch[1];
+  }
+  
+  // Pattern 4: Last segment of path
+  const pathMatch = cleanUrl.match(/\/([^/]+)$/);
+  if (pathMatch) {
+    return pathMatch[1];
+  }
+  
+  return null;
+}
 
-  if (!match) {
-    throw new Error('URL no válida');
+export async function extractFromUrl(url: string): Promise<{ title: string; content: string } | null> {
+  console.log('Extracting from URL:', url);
+  
+  const mediaKey = extractMediaKey(url);
+  console.log('Extracted media key:', mediaKey);
+
+  if (!mediaKey) {
+    throw new Error('URL no válida - no se pudo extraer el identificador del video');
   }
 
-  const mediaKey = match[1];
+  // Call the mediator API through CORS proxy
+  const apiUrl = `${CORS_PROXY}${encodeURIComponent(`https://b.jw-cdn.org/apis/mediator/v1/media-items/${LANG_SYMBOL}/${mediaKey}?clientType=www`)}`;
+  
+  console.log('Fetching API:', apiUrl);
 
-  // Call the mediator API
-  const apiUrl = `https://b.jw-cdn.org/apis/mediator/v1/media-items/${LANG_SYMBOL}/${mediaKey}?clientType=www`;
+  try {
+    const response = await fetch(apiUrl, {
+      headers: {
+        'Accept': 'application/json',
+      },
+    });
 
-  const response = await fetch(apiUrl, {
-    headers: {
-      'Accept': 'application/json',
-    },
-  });
+    console.log('API Response status:', response.status);
 
-  if (!response.ok) {
-    if (response.status === 404) {
-      throw new Error('Video no encontrado');
+    if (!response.ok) {
+      if (response.status === 404) {
+        throw new Error('Video no encontrado. Verifica que el enlace sea correcto.');
+      }
+      throw new Error(`Error del servidor: ${response.status}`);
     }
-    throw new Error(`Error: ${response.status}`);
-  }
 
-  const data = await response.json();
+    const data = await response.json();
+    console.log('API Response data:', data);
 
-  const mediaList = data.media || [];
-  if (mediaList.length === 0) {
-    throw new Error('No se encontró contenido multimedia');
-  }
+    const mediaList = data.media || [];
+    if (mediaList.length === 0) {
+      throw new Error('No se encontró contenido multimedia en este enlace');
+    }
 
-  const mediaItem = mediaList[0];
-  const title = mediaItem.title || mediaKey;
-  let vttUrl: string | null = null;
+    const mediaItem = mediaList[0];
+    const title = mediaItem.title || mediaKey;
+    let vttUrl: string | null = null;
 
-  // Look for subtitles
-  if (mediaItem.subtitles?.url) {
-    vttUrl = mediaItem.subtitles.url;
-  } else if (mediaItem.files) {
-    for (const file of mediaItem.files) {
-      if (file.subtitles?.url) {
-        vttUrl = file.subtitles.url;
-        break;
+    // Look for subtitles in different locations
+    if (mediaItem.subtitles?.url) {
+      vttUrl = mediaItem.subtitles.url;
+    } else if (mediaItem.files) {
+      for (const file of mediaItem.files) {
+        if (file.subtitles?.url) {
+          vttUrl = file.subtitles.url;
+          break;
+        }
       }
     }
+
+    console.log('VTT URL found:', vttUrl);
+
+    if (!vttUrl) {
+      throw new Error('Este video no tiene subtítulos disponibles');
+    }
+
+    // Download VTT content through CORS proxy
+    const vttProxyUrl = `${CORS_PROXY}${encodeURIComponent(vttUrl)}`;
+    console.log('Fetching VTT:', vttProxyUrl);
+    
+    const vttResponse = await fetch(vttProxyUrl);
+    if (!vttResponse.ok) {
+      throw new Error('Error descargando subtítulos');
+    }
+
+    const vttContent = await vttResponse.text();
+    console.log('VTT content length:', vttContent.length);
+    
+    const content = convertVttToText(vttContent);
+
+    if (!content || content.length === 0) {
+      throw new Error('El archivo de subtítulos está vacío');
+    }
+
+    return {
+      title: cleanFileName(title),
+      content,
+    };
+  } catch (error) {
+    console.error('Extraction error:', error);
+    throw error;
   }
-
-  if (!vttUrl) {
-    throw new Error('No hay subtítulos disponibles');
-  }
-
-  // Download VTT content
-  const vttResponse = await fetch(vttUrl);
-  if (!vttResponse.ok) {
-    throw new Error('Error descargando subtítulos');
-  }
-
-  const vttContent = await vttResponse.text();
-  const content = convertVttToText(vttContent);
-
-  return {
-    title: cleanFileName(title),
-    content,
-  };
 }
 
 export function downloadAsTxt(filename: string, content: string) {
